@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
 from py4D_browser.utils import make_detector, StatusBarWriter
 from py4D_browser.menu_actions import show_file_dialog, get_ND, find_calibrations
 from py4D_browser.dialogs import ResizeDialog
+from py4D_browser.update_views import get_virtual_image_detector
 
 class KernelPlugin(QWidget):
 
@@ -51,75 +52,26 @@ class KernelPlugin(QWidget):
         self.parent = parent
 
         probe_vacuum = plugin_menu.addAction("Generate probe from vacuum file...")
-        probe_vacuum.triggered.connect(self.load_vacuum_file)
+        probe_vacuum.triggered.connect(lambda: self.launch_probekernel_window(source="vacuum"))
         probe_selection = plugin_menu.addAction("Generate probe from selection...")
+        probe_selection.triggered.connect(lambda: self.launch_probekernel_window(source="selection"))
 
     def close(self):
         pass  # perform any shutdown activities
 
-    def launch_probekernel_window(self):
-        dialog = ProbeKernelDialog(parent=self.parent, vac_datacube=self.vacuum_datacube)
+    def launch_probekernel_window(self, source):
+        dialog = ProbeKernelDialog(parent=self.parent, source=source)
         dialog.show()
 
-    def load_vacuum_file(self, checked=False, mmap=False, binning=1):
-
-        filepath = show_file_dialog(self)
-
-        print(f"Loading file {filepath}")
-        extension = os.path.splitext(filepath)[-1].lower()
-        print(f"Type: {extension}")
-        if extension in (".h5", ".hdf5", ".py4dstem", ".emd", ".mat"):
-            file = h5py.File(filepath, "r")
-            datacubes = get_ND(file)
-            print(f"Found {len(datacubes)} 4D datasets inside the HDF5 file...")
-            if len(datacubes) >= 1:
-                # Read the first datacube in the HDF5 file into RAM
-                print(f"Reading dataset at location {datacubes[0].name}")
-                self.vacuum_datacube = py4DSTEM.DataCube(
-                    datacubes[0] if mmap else datacubes[0][()]
-                )
-
-                R_size, R_units, Q_size, Q_units = find_calibrations(datacubes[0])
-
-                self.vacuum_datacube.calibration.set_R_pixel_size(R_size)
-                self.vacuum_datacube.calibration.set_R_pixel_units(R_units)
-                self.vacuum_datacube.calibration.set_Q_pixel_size(Q_size)
-                self.vacuum_datacube.calibration.set_Q_pixel_units(Q_units)
-
-            else:
-                # if no 4D data was found, look for 3D data
-                datacubes = get_ND(file, N=3)
-                print(f"Found {len(datacubes)} 3D datasets inside the HDF5 file...")
-                if len(datacubes) >= 1:
-                    array = datacubes[0] if mmap else datacubes[0][()]
-                    new_shape = ResizeDialog.get_new_size([1, array.shape[0]], parent=self)
-                    self.vacuum_datacube = py4DSTEM.DataCube(
-                        array.reshape(*new_shape, *array.shape[1:])
-                    )
-                else:
-                    raise ValueError("No 4D (or even 3D) data detected in the H5 file!")
-        elif extension in [".npy"]:
-            self.vacuum_datacube = py4DSTEM.DataCube(np.load(filepath))
-        else:
-            self.vacuum_datacube = py4DSTEM.import_file(
-                filepath,
-                mem="MEMMAP" if mmap else "RAM",
-                binfactor=binning,
-            )
-
-        self.launch_probekernel_window()
-        # self.generate_probe()
-
 class ProbeKernelDialog(QDialog):
-    def __init__(self, parent, vac_datacube):
+    def __init__(self, parent, source):
         super().__init__(parent)
         self.parent = parent
+        self.source = source
 
-        self.vacuum_datacube = vac_datacube
+        self.probe, self.alpha_pr, self.qx0_pr, self.qy0_pr = self.generate_probe(self.source)
 
-        self.probe, self.alpha_pr, self.qx0_pr, self.qy0_pr = self.generate_probe()
-
-        self.setWindowTitle("Probe from vacuum file")  # Set the window title
+        self.setWindowTitle("Kernel Window")  # Set the window title
         self.setModal(True)  # Make the dialog modal
         self.setMinimumWidth(300)
         self.setMinimumHeight(200)
@@ -191,10 +143,18 @@ class ProbeKernelDialog(QDialog):
             self.r_inner.setEnabled(False)
             self.sigma.setEnabled(False)
 
-    def generate_probe(self):
+    def generate_probe(self, source):
 
-        probe = self.vacuum_datacube.get_vacuum_probe()
-        alpha_pr, qx0_pr, qy0_pr = self.vacuum_datacube.get_probe_size(probe.probe)
+        if source == "vacuum":
+            self.vacuum_datacube = self.load_vacuum_file()
+            probe = self.vacuum_datacube.get_vacuum_probe()
+            alpha_pr, qx0_pr, qy0_pr = self.vacuum_datacube.get_probe_size(probe.probe)
+
+        if source == "selection":
+            detector_info = get_virtual_image_detector(self.parent)
+            self.selection_mask = detector_info['mask']
+            probe = self.parent.datacube.get_vacuum_probe(ROI=self.selection_mask)
+            alpha_pr, qx0_pr, qy0_pr = self.parent.datacube.get_probe_size(probe.probe)
 
         return probe, alpha_pr, qx0_pr, qy0_pr
 
@@ -233,3 +193,51 @@ class ProbeKernelDialog(QDialog):
         im_kernel = np.fft.fftshift(kernel)
 
         self.kernel_image.setImage(im_kernel)
+
+    def load_vacuum_file(self, checked=False, mmap=False, binning=1):
+
+        filepath = show_file_dialog(self)
+
+        print(f"Loading file {filepath}")
+        extension = os.path.splitext(filepath)[-1].lower()
+        print(f"Type: {extension}")
+        if extension in (".h5", ".hdf5", ".py4dstem", ".emd", ".mat"):
+            file = h5py.File(filepath, "r")
+            datacubes = get_ND(file)
+            print(f"Found {len(datacubes)} 4D datasets inside the HDF5 file...")
+            if len(datacubes) >= 1:
+                # Read the first datacube in the HDF5 file into RAM
+                print(f"Reading dataset at location {datacubes[0].name}")
+                vacuum_datacube = py4DSTEM.DataCube(
+                    datacubes[0] if mmap else datacubes[0][()]
+                )
+
+                R_size, R_units, Q_size, Q_units = find_calibrations(datacubes[0])
+
+                vacuum_datacube.calibration.set_R_pixel_size(R_size)
+                vacuum_datacube.calibration.set_R_pixel_units(R_units)
+                vacuum_datacube.calibration.set_Q_pixel_size(Q_size)
+                vacuum_datacube.calibration.set_Q_pixel_units(Q_units)
+
+            else:
+                # if no 4D data was found, look for 3D data
+                datacubes = get_ND(file, N=3)
+                print(f"Found {len(datacubes)} 3D datasets inside the HDF5 file...")
+                if len(datacubes) >= 1:
+                    array = datacubes[0] if mmap else datacubes[0][()]
+                    new_shape = ResizeDialog.get_new_size([1, array.shape[0]], parent=self)
+                    vacuum_datacube = py4DSTEM.DataCube(
+                        array.reshape(*new_shape, *array.shape[1:])
+                    )
+                else:
+                    raise ValueError("No 4D (or even 3D) data detected in the H5 file!")
+        elif extension in [".npy"]:
+            vacuum_datacube = py4DSTEM.DataCube(np.load(filepath))
+        else:
+            vacuum_datacube = py4DSTEM.import_file(
+                filepath,
+                mem="MEMMAP" if mmap else "RAM",
+                binfactor=binning,
+            )
+
+        return vacuum_datacube
