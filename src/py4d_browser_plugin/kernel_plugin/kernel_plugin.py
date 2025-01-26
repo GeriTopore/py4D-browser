@@ -115,7 +115,9 @@ class ProbeKernelDialog(QDialog):
         super().__init__(parent)
         self.parent = parent
 
-        self.probe = vac_datacube.get_vacuum_probe()
+        self.vacuum_datacube = vac_datacube
+
+        self.probe, self.alpha_pr, self.qx0_pr, self.qy0_pr = self.generate_probe()
 
         self.setWindowTitle("Probe from vacuum file")  # Set the window title
         self.setModal(True)  # Make the dialog modal
@@ -134,12 +136,6 @@ class ProbeKernelDialog(QDialog):
 
         self.probe.get_kernel(mode='flat')
 
-        kernel = self.probe.kernel
-
-        # shift zero frequency to the center
-        im_kernel = np.fft.fftshift(kernel)
-
-        self.kernel_image.setImage(im_kernel)
         layout.addWidget(self.kernel_image)
 
         self.probe_kernel_settings = QGroupBox('Kernel Settings')
@@ -165,6 +161,7 @@ class ProbeKernelDialog(QDialog):
         self.divider.setMinimumHeight(2)
 
         self.generate_kernel_button = QPushButton("Generate Kernel")
+        self.generate_kernel_button.clicked.connect(self.update_kernel_view)
 
         self.probe_kernel_settings_layout = QFormLayout()
         self.probe_kernel_settings_layout.addRow("Kernel Mode", self.kernel_mode)
@@ -193,3 +190,46 @@ class ProbeKernelDialog(QDialog):
             self.r_outer.setEnabled(False)
             self.r_inner.setEnabled(False)
             self.sigma.setEnabled(False)
+
+    def generate_probe(self):
+
+        probe = self.vacuum_datacube.get_vacuum_probe()
+        alpha_pr, qx0_pr, qy0_pr = self.vacuum_datacube.get_probe_size(probe.probe)
+
+        return probe, alpha_pr, qx0_pr, qy0_pr
+
+
+    def update_kernel_view(self):
+        # Update the kernel view
+        # probe_settings = self.kernel_mode
+        sigma = None
+        radii = None
+
+        if self.kernel_mode.currentText() == "gaussian":
+            sigma = self.sigma.value()
+            self.probe.get_kernel(
+                mode=self.kernel_mode.currentText(),
+                origin=(self.qx0_pr, self.qy0_pr),
+                sigma=sigma
+                )
+
+        elif self.kernel_mode.currentText() in ["sigmoid", "log sigmoid"]:
+            radii = (self.alpha_pr*self.r_inner.value(),
+                     self.alpha_pr*self.r_outer.value())
+            self.probe.get_kernel(
+                mode=self.kernel_mode.currentText(),
+                origin=(self.qx0_pr, self.qy0_pr),
+                radii=radii
+                )
+        else:
+            self.probe.get_kernel(
+                mode=self.kernel_mode.currentText(),
+                origin=(self.qx0_pr, self.qy0_pr)
+                )
+
+        kernel = self.probe.kernel
+
+        # shift zero frequency to the center
+        im_kernel = np.fft.fftshift(kernel)
+
+        self.kernel_image.setImage(im_kernel)
