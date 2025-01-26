@@ -21,6 +21,8 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QCheckBox,
     QWidget,
+    QDoubleSpinBox,
+    QFormLayout,
 )
 from py4D_browser.utils import make_detector, StatusBarWriter
 from py4D_browser.menu_actions import show_file_dialog, get_ND, find_calibrations
@@ -128,18 +130,66 @@ class ProbeKernelDialog(QDialog):
         layout.addWidget(self.probe_image)
 
         self.kernel_image = pg.ImageView()
+        self.kernel_image.setImage(np.zeros((512, 512)))
 
         self.probe.get_kernel(mode='flat')
 
-        # shift zero frequency to the center
-        # R = 24
         kernel = self.probe.kernel
-        # im_kernel = np.vstack(
-        #     [
-        #         np.hstack([kernel[-int(R) :, -int(R) :], kernel[-int(R) :, : int(R)]]),
-        #         np.hstack([kernel[: int(R), -int(R) :], kernel[: int(R), : int(R)]]),
-        #     ]
-        # )
+
+        # shift zero frequency to the center
         im_kernel = np.fft.fftshift(kernel)
+
         self.kernel_image.setImage(im_kernel)
         layout.addWidget(self.kernel_image)
+
+        self.probe_kernel_settings = QGroupBox('Kernel Settings')
+        self.kernel_mode = QComboBox()
+
+        self.kernel_mode.addItem("flat")
+        self.kernel_mode.addItem("gaussian")
+        self.kernel_mode.addItem("sigmoid")
+        self.kernel_mode.addItem("sigmoid_log")
+
+        self.sigma = QDoubleSpinBox()
+        self.r_outer = QDoubleSpinBox()
+        self.r_inner = QDoubleSpinBox()
+        self.sigma.setEnabled(False)
+        self.r_outer.setEnabled(False)
+        self.r_inner.setEnabled(False)
+
+        self.kernel_mode.currentTextChanged.connect(self.update_kernel_settings)
+
+        self.divider = QFrame()
+        self.divider.setFrameShape(QFrame.HLine)
+        self.divider.setFrameShadow(QFrame.Sunken)
+        self.divider.setMinimumHeight(2)
+
+        self.generate_kernel_button = QPushButton("Generate Kernel")
+
+        self.probe_kernel_settings_layout = QFormLayout()
+        self.probe_kernel_settings_layout.addRow("Kernel Mode", self.kernel_mode)
+        self.probe_kernel_settings_layout.addRow("Sigma", self.sigma)
+        self.probe_kernel_settings_layout.addRow("Outer Radius", self.r_outer)
+        self.probe_kernel_settings_layout.addRow("Inner Radius", self.r_inner)
+        self.probe_kernel_settings_layout.addRow(self.divider)
+        self.probe_kernel_settings_layout.addRow(self.generate_kernel_button)
+
+        self.probe_kernel_settings.setLayout(self.probe_kernel_settings_layout)
+
+        layout.addWidget(self.probe_kernel_settings)
+
+    def update_kernel_settings(self, value):
+        if value == "sigmoid" or value == "sigmoid_log":
+            self.r_outer.setEnabled(True)
+            self.r_inner.setEnabled(True)
+            self.sigma.setEnabled(False)
+
+        elif value == "gaussian":
+            self.r_outer.setEnabled(False)
+            self.r_inner.setEnabled(False)
+            self.sigma.setEnabled(True)
+
+        else:
+            self.r_outer.setEnabled(False)
+            self.r_inner.setEnabled(False)
+            self.sigma.setEnabled(False)
