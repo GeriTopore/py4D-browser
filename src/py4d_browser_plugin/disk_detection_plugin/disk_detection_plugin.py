@@ -1,10 +1,12 @@
 import os
+from functools import partial
 
 import h5py
 import numpy as np
 import pyqtgraph as pg
 import py4DSTEM
 from PyQt5.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -14,6 +16,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QRadioButton,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -150,7 +153,7 @@ class ProbeKernelTab(QWidget):
         self._vacuum_datacube = None
 
         # ---- vacuum region source ----
-        source_box = QGroupBox("Vacuum Region")
+        source_box = QGroupBox("Probe Source")
         source_layout = QVBoxLayout()
 
         button_row = QHBoxLayout()
@@ -161,10 +164,33 @@ class ProbeKernelTab(QWidget):
         load_vacuum_button = QPushButton("Load Vacuum File...")
         load_vacuum_button.clicked.connect(self.load_vacuum_file)
         button_row.addWidget(load_vacuum_button)
+
+        use_synthetic_button = QPushButton("Synthetic Probe")
+        use_synthetic_button.clicked.connect(self.use_synthetic_probe)
+        button_row.addWidget(use_synthetic_button)
         source_layout.addLayout(button_row)
 
         self.source_label = QLabel("No vacuum region selected yet")
         source_layout.addWidget(self.source_label)
+
+        # Only used when the source is "Synthetic Probe". Radius defaults to
+        # (and is kept in sync with) the most recently measured bright-field
+        # disk radius, so switching to a synthetic probe starts from a
+        # physically sensible size.
+        synth_form = QFormLayout()
+        self.synth_radius_spin = QDoubleSpinBox()
+        self.synth_radius_spin.setRange(0.5, 1000.0)
+        self.synth_radius_spin.setValue(10.0)
+        self.synth_radius_spin.setEnabled(False)
+        synth_form.addRow("Synthetic Radius (px)", self.synth_radius_spin)
+
+        self.synth_width_spin = QDoubleSpinBox()
+        self.synth_width_spin.setRange(0.1, 100.0)
+        self.synth_width_spin.setValue(4.0)
+        self.synth_width_spin.setEnabled(False)
+        synth_form.addRow("Synthetic Edge Width (px)", self.synth_width_spin)
+
+        source_layout.addLayout(synth_form)
         source_box.setLayout(source_layout)
 
         # ---- mask settings + probe generation ----
@@ -284,9 +310,10 @@ class ProbeKernelTab(QWidget):
         self.update_kernel_controls_enabled(self.kernel_mode_combo.currentText())
 
     def use_current_selection(self):
-        self._source = "selection"
         self._vacuum_datacube = None
-        self.source_label.setText("Source: rectangular selection on current dataset")
+        self._set_source(
+            "selection", "Source: rectangular selection on current dataset"
+        )
 
     def load_vacuum_file(self):
         parent = self.window.parent
@@ -302,8 +329,22 @@ class ProbeKernelTab(QWidget):
             return
 
         self._vacuum_datacube = datacube
-        self._source = "vacuum_file"
-        self.source_label.setText(f"Source: {os.path.basename(filepath)}")
+        self._set_source("vacuum_file", f"Source: {os.path.basename(filepath)}")
+
+    def use_synthetic_probe(self):
+        self._vacuum_datacube = None
+        self._set_source("synthetic", "Source: synthetic probe")
+
+    def _set_source(self, source, label_text):
+        self._source = source
+        self.source_label.setText(label_text)
+
+        is_synthetic = source == "synthetic"
+        self.threshold_spin.setEnabled(not is_synthetic)
+        self.expansion_spin.setEnabled(not is_synthetic)
+        self.opening_spin.setEnabled(not is_synthetic)
+        self.synth_radius_spin.setEnabled(is_synthetic)
+        self.synth_width_spin.setEnabled(is_synthetic)
 
     def generate_probe(self):
         parent = self.window.parent
@@ -312,10 +353,6 @@ class ProbeKernelTab(QWidget):
                 "Load a dataset in the main window first!", 5_000
             )
             return
-
-        threshold = self.threshold_spin.value()
-        expansion = self.expansion_spin.value()
-        opening = self.opening_spin.value()
 
         if self._source == "selection":
             detector: DetectorInfo = parent.get_virtual_image_detector()
@@ -326,23 +363,45 @@ class ProbeKernelTab(QWidget):
                     5_000,
                 )
                 return
-            probe_source = parent.datacube
-            roi_kwargs = {"ROI": detector["mask"]}
+            self.probe = parent.datacube.get_vacuum_probe(
+                threshold=self.threshold_spin.value(),
+                expansion=self.expansion_spin.value(),
+                opening=self.opening_spin.value(),
+                ROI=detector["mask"],
+            )
+            self.alpha, self.qx0, self.qy0 = parent.datacube.get_probe_size(
+                self.probe.probe
+            )
+            self.synth_radius_spin.setValue(self.alpha)
+
         elif self._source == "vacuum_file":
-            probe_source = self._vacuum_datacube
-            roi_kwargs = {}
+            if self._vacuum_datacube is None:
+                parent.statusBar().showMessage("Load a vacuum file first!", 5_000)
+                return
+            self.probe = self._vacuum_datacube.get_vacuum_probe(
+                threshold=self.threshold_spin.value(),
+                expansion=self.expansion_spin.value(),
+                opening=self.opening_spin.value(),
+            )
+            self.alpha, self.qx0, self.qy0 = parent.datacube.get_probe_size(
+                self.probe.probe
+            )
+            self.synth_radius_spin.setValue(self.alpha)
+
+        elif self._source == "synthetic":
+            Qshape = (parent.datacube.Q_Nx, parent.datacube.Q_Ny)
+            radius = self.synth_radius_spin.value()
+            self.probe = py4DSTEM.Probe.generate_synthetic_probe(
+                radius=radius, width=self.synth_width_spin.value(), Qshape=Qshape
+            )
+            self.alpha = radius
+            self.qx0, self.qy0 = Qshape[0] / 2.0, Qshape[1] / 2.0
+
         else:
             parent.statusBar().showMessage(
                 "Choose a vacuum region source first!", 5_000
             )
             return
-
-        self.probe = probe_source.get_vacuum_probe(
-            threshold=threshold, expansion=expansion, opening=opening, **roi_kwargs
-        )
-        self.alpha, self.qx0, self.qy0 = parent.datacube.get_probe_size(
-            self.probe.probe
-        )
 
         self.probe_view.setImage(self.probe.probe, autoLevels=True, autoRange=True)
         self.accept_button.setEnabled(False)
@@ -405,17 +464,17 @@ class BraggDiskSettingsPane(QGroupBox):
 
         self.sigma_cc_spin = QDoubleSpinBox()
         self.sigma_cc_spin.setRange(0.0, 100.0)
-        self.sigma_cc_spin.setValue(2.0)
+        self.sigma_cc_spin.setValue(0.0)
         form.addRow("Correlation Smoothing Sigma", self.sigma_cc_spin)
 
         self.subpixel_combo = QComboBox()
         self.subpixel_combo.addItems(["pixel", "poly", "multicorr"])
-        self.subpixel_combo.setCurrentText("multicorr")
+        self.subpixel_combo.setCurrentText("poly")
         form.addRow("Subpixel Mode", self.subpixel_combo)
 
         self.upsample_factor_spin = QSpinBox()
-        self.upsample_factor_spin.setRange(1, 256)
-        self.upsample_factor_spin.setValue(16)
+        self.upsample_factor_spin.setRange(0, 256)
+        self.upsample_factor_spin.setValue(0)
         form.addRow("Upsample Factor", self.upsample_factor_spin)
 
         self.min_abs_intensity_spin = QDoubleSpinBox()
@@ -428,7 +487,7 @@ class BraggDiskSettingsPane(QGroupBox):
         self.min_rel_intensity_spin.setRange(0.0, 1.0)
         self.min_rel_intensity_spin.setDecimals(5)
         self.min_rel_intensity_spin.setSingleStep(0.001)
-        self.min_rel_intensity_spin.setValue(0.005)
+        self.min_rel_intensity_spin.setValue(0.0)
         form.addRow("Minimum Relative Intensity", self.min_rel_intensity_spin)
 
         self.relative_to_peak_spin = QSpinBox()
@@ -438,17 +497,17 @@ class BraggDiskSettingsPane(QGroupBox):
 
         self.min_peak_spacing_spin = QSpinBox()
         self.min_peak_spacing_spin.setRange(0, 1000)
-        self.min_peak_spacing_spin.setValue(60)
+        self.min_peak_spacing_spin.setValue(0)
         form.addRow("Minimum Peak Spacing (px)", self.min_peak_spacing_spin)
 
         self.edge_boundary_spin = QSpinBox()
         self.edge_boundary_spin.setRange(0, 1000)
-        self.edge_boundary_spin.setValue(20)
+        self.edge_boundary_spin.setValue(0)
         form.addRow("Edge Boundary (px)", self.edge_boundary_spin)
 
         self.max_num_peaks_spin = QSpinBox()
-        self.max_num_peaks_spin.setRange(1, 1000)
-        self.max_num_peaks_spin.setValue(70)
+        self.max_num_peaks_spin.setRange(0, 1000)
+        self.max_num_peaks_spin.setValue(0)
         form.addRow("Max Number of Peaks", self.max_num_peaks_spin)
 
         self.cuda_checkbox = QCheckBox()
@@ -496,6 +555,9 @@ class BraggPreviewPane(QGroupBox):
     def __init__(self, title):
         super().__init__(title)
 
+        self.last_dp = None
+        self._has_shown_dp = False
+
         self.rs_view = pg.ImageView()
         self.rs_view.setImage(np.zeros((25, 25)))
         self.rs_selector = pg_point_roi(self.rs_view.getView())
@@ -536,13 +598,27 @@ class BraggPreviewPane(QGroupBox):
         yc = int(np.clip(yc, 0, datacube.R_Ny - 1))
         return xc, yc
 
-    def update_dp_and_scatter(self, dp, qx, qy):
-        # Square-root scaling (matching the main window's default diffraction
-        # scaling) plus percentile-based levels, so the faint diffracted
-        # disks remain visible alongside the much brighter central beam.
-        scaled = np.sqrt(np.maximum(dp, 0))
-        levels = tuple(np.percentile(scaled, [0.1, 99.9]))
-        self.dp_view.setImage(scaled, autoLevels=False, levels=levels, autoRange=True)
+    def update_dp(self, dp, scale_fn, relevel):
+        self.last_dp = dp
+        scaled = scale_fn(dp)
+
+        if relevel or not self._has_shown_dp:
+            levels = tuple(np.percentile(scaled, [0.1, 99.9]))
+            self.dp_view.setImage(
+                scaled,
+                autoLevels=False,
+                levels=levels,
+                autoRange=not self._has_shown_dp,
+            )
+            self._has_shown_dp = True
+        else:
+            # Leave levels untouched -- pyqtgraph does not reset them when
+            # autoLevels=False and no explicit levels are given, so any
+            # level range the user dragged in by hand on the histogram
+            # widget survives a scan-position-only update.
+            self.dp_view.setImage(scaled, autoLevels=False, autoRange=False)
+
+    def update_scatter(self, qx, qy):
         # ScatterPlotItem positions map directly onto the array indices
         # ImageView.setImage was given -- no axis swap needed here (verified
         # empirically; the old interactive_disk_detection branch's swap was
@@ -552,38 +628,112 @@ class BraggPreviewPane(QGroupBox):
 
 
 class BraggDiskTab(QWidget):
+    # Start with a single preview pane; this caps how many more the user
+    # can add via the "Add Preview Position" button.
+    MAX_ADDITIONAL_PANES = 3
+
     def __init__(self, window: "DiskDetectionWindow"):
         super().__init__()
 
         self.window = window
+        self.panes = []
 
         self.settings_pane = BraggDiskSettingsPane()
-        self.settings_pane.connect_changed(self.update_previews)
+        self.settings_pane.connect_changed(self.on_detection_params_changed)
+
+        scaling_box = self._build_scaling_box()
 
         self.find_all_button = QPushButton("Find All Bragg Disks")
         self.find_all_button.clicked.connect(self.find_all)
 
+        self.add_pane_button = QPushButton("Add Preview Position")
+        self.add_pane_button.clicked.connect(self.add_pane)
+
         left_layout = QVBoxLayout()
         left_layout.addWidget(self.settings_pane)
+        left_layout.addWidget(scaling_box)
         left_layout.addWidget(self.find_all_button)
+        left_layout.addWidget(self.add_pane_button)
         left_layout.addStretch()
         left_widget = QWidget()
         left_widget.setLayout(left_layout)
 
-        self.panes = [BraggPreviewPane(f"Preview {i + 1}") for i in range(3)]
-        for pane in self.panes:
-            pane.rs_selector.sigRegionChangeFinished.connect(self.update_previews)
-
-        previews_layout = QHBoxLayout()
-        for pane in self.panes:
-            previews_layout.addWidget(pane)
+        self.previews_layout = QHBoxLayout()
         previews_widget = QWidget()
-        previews_widget.setLayout(previews_layout)
+        previews_widget.setLayout(self.previews_layout)
 
         layout = QHBoxLayout()
         layout.addWidget(left_widget, 1)
         layout.addWidget(previews_widget, 4)
         self.setLayout(layout)
+
+        self._append_pane()
+
+    def _build_scaling_box(self):
+        scaling_box = QGroupBox("Diffraction Display Scaling")
+        scaling_layout = QVBoxLayout()
+
+        self.scaling_group = QButtonGroup(self)
+        self.linear_radio = QRadioButton("Linear")
+        self.log_radio = QRadioButton("Log")
+        self.power_radio = QRadioButton("Power")
+        self.power_radio.setChecked(True)
+        for button in (self.linear_radio, self.log_radio, self.power_radio):
+            self.scaling_group.addButton(button)
+            scaling_layout.addWidget(button)
+            # only redraw once, when a button becomes checked -- QButtonGroup
+            # toggles the old and new selection in the same click
+            button.toggled.connect(
+                lambda checked: self.on_scaling_changed() if checked else None
+            )
+
+        gamma_row = QHBoxLayout()
+        gamma_row.addWidget(QLabel("Power"))
+        self.gamma_spin = QDoubleSpinBox()
+        self.gamma_spin.setRange(0.01, 2.0)
+        self.gamma_spin.setSingleStep(0.05)
+        self.gamma_spin.setValue(0.5)
+        self.gamma_spin.valueChanged.connect(self.on_scaling_changed)
+        gamma_row.addWidget(self.gamma_spin)
+        scaling_layout.addLayout(gamma_row)
+
+        scaling_box.setLayout(scaling_layout)
+        return scaling_box
+
+    def get_scaling_fn(self):
+        gamma = self.gamma_spin.value()
+        if self.linear_radio.isChecked():
+            return lambda dp: dp.astype(np.float64, copy=False)
+        elif self.log_radio.isChecked():
+            return lambda dp: np.log(np.maximum(dp, 1e-6))
+        else:
+            return lambda dp: np.power(np.maximum(dp, 0), gamma)
+
+    def _append_pane(self):
+        if len(self.panes) - 1 >= self.MAX_ADDITIONAL_PANES:
+            return
+
+        pane = BraggPreviewPane(f"Preview {len(self.panes) + 1}")
+        # sigRegionChanged (not sigRegionChangeFinished) fires continuously
+        # while dragging, so the preview updates live as the point selector
+        # is moved rather than only once it's released.
+        pane.rs_selector.sigRegionChanged.connect(
+            partial(self.update_previews, panes=[pane])
+        )
+        self.panes.append(pane)
+        self.previews_layout.addWidget(pane)
+
+        if self.window.probe is not None:
+            parent = self.window.parent
+            pane.set_realspace_image(parent.get_virtual_image())
+            pane.set_marker_diameter(2 * self.window.probe_radius)
+            self.update_previews(panes=[pane])
+
+        if len(self.panes) - 1 >= self.MAX_ADDITIONAL_PANES:
+            self.add_pane_button.setEnabled(False)
+
+    def add_pane(self):
+        self._append_pane()
 
     def on_probe_accepted(self):
         parent = self.window.parent
@@ -594,28 +744,61 @@ class BraggDiskTab(QWidget):
             pane.set_marker_diameter(diameter)
         self.update_previews()
 
-    def update_previews(self, *_):
+    def _find_peaks(self, dp, xc, yc, probe, params):
+        parent = self.window.parent
+        try:
+            peaks = parent.datacube.find_Bragg_disks(
+                template=probe.kernel, data=(xc, yc), **params
+            )
+            return peaks.qx, peaks.qy
+        except Exception as exc:
+            parent.statusBar().showMessage(f"Peak finding failed: {exc}", 5_000)
+            return np.array([]), np.array([])
+
+    def update_previews(self, panes=None, relevel=False):
+        # Called when a pane's point selector moves (position + peaks +
+        # display all need refreshing for that pane).
+        parent = self.window.parent
+        probe = self.window.probe
+        if probe is None or parent.datacube is None:
+            return
+
+        panes = panes if panes is not None else self.panes
+        params = self.settings_pane.get_params()
+        scale_fn = self.get_scaling_fn()
+
+        for pane in panes:
+            xc, yc = pane.get_scan_position(parent.datacube)
+            dp = parent.datacube.data[xc, yc, :, :]
+            qx, qy = self._find_peaks(dp, xc, yc, probe, params)
+            pane.update_dp(dp, scale_fn, relevel=relevel)
+            pane.update_scatter(qx, qy)
+
+    def on_detection_params_changed(self, *_):
+        # Detection-only parameters (thresholds, corrPower, etc.) don't
+        # change the diffraction pattern or its display scaling, only which
+        # peaks are found -- so just rerun peak-finding against each pane's
+        # cached DP, without touching the displayed image or its levels.
         parent = self.window.parent
         probe = self.window.probe
         if probe is None or parent.datacube is None:
             return
 
         params = self.settings_pane.get_params()
-
         for pane in self.panes:
+            if pane.last_dp is None:
+                continue
             xc, yc = pane.get_scan_position(parent.datacube)
-            dp = parent.datacube.data[xc, yc, :, :]
+            qx, qy = self._find_peaks(pane.last_dp, xc, yc, probe, params)
+            pane.update_scatter(qx, qy)
 
-            try:
-                peaks = parent.datacube.find_Bragg_disks(
-                    template=probe.kernel, data=(xc, yc), **params
-                )
-                qx, qy = peaks.qx, peaks.qy
-            except Exception as exc:
-                parent.statusBar().showMessage(f"Peak finding failed: {exc}", 5_000)
-                qx, qy = np.array([]), np.array([])
-
-            pane.update_dp_and_scatter(dp, qx, qy)
+    def on_scaling_changed(self, *_):
+        # Scaling mode/gamma changed -- redisplay each pane's cached DP with
+        # freshly computed percentile levels for the new scaling function.
+        scale_fn = self.get_scaling_fn()
+        for pane in self.panes:
+            if pane.last_dp is not None:
+                pane.update_dp(pane.last_dp, scale_fn, relevel=True)
 
     def find_all(self):
         parent = self.window.parent
