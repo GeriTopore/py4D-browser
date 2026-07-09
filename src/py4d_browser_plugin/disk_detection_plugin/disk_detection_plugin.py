@@ -5,6 +5,7 @@ import h5py
 import numpy as np
 import pyqtgraph as pg
 import py4DSTEM
+from PyQt5 import QtCore
 from PyQt5.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -18,6 +19,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSpinBox,
+    QSplitter,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -31,6 +33,34 @@ from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from py4D_browser import DataViewer
+
+
+def _vacuum_probe_from_single_pixel(datacube, xc, yc, threshold, expansion, opening):
+    """
+    Work around a py4DSTEM bug (as of 0.14.18): DataCube.get_vacuum_probe's
+    internal averaging loop is skipped entirely when the ROI contains
+    exactly one scan position, leaving its `probe` variable as a raw view
+    into datacube.data (sometimes read-only, and the wrong dtype for the
+    in-place `probe *= mask` that follows) -- both fail. Replicate the same
+    thresholding/expansion/opening masking on a writable float copy
+    instead, since averaging over a single pattern is just that pattern.
+    """
+    from scipy.ndimage import binary_dilation, binary_opening, distance_transform_edt
+
+    probe = datacube.data[xc, yc, :, :].astype(np.float64)
+    mask = probe > np.max(probe) * threshold
+    mask = binary_opening(mask, iterations=opening)
+    mask = binary_dilation(mask, iterations=1)
+    mask = (
+        np.cos(
+            (np.pi / 2)
+            * np.minimum(distance_transform_edt(np.logical_not(mask)) / expansion, 1)
+        )
+        ** 2
+    )
+    probe = py4DSTEM.Probe(probe * mask)
+    datacube.attach(probe)
+    return probe
 
 
 def _load_datacube_from_file(
@@ -181,7 +211,6 @@ class ProbeKernelTab(QWidget):
         self.synth_radius_spin = QDoubleSpinBox()
         self.synth_radius_spin.setRange(0.5, 1000.0)
         self.synth_radius_spin.setValue(10.0)
-        self.synth_radius_spin.setEnabled(False)
         synth_form.addRow("Synthetic Radius (px)", self.synth_radius_spin)
 
         self.synth_width_spin = QDoubleSpinBox()
@@ -290,30 +319,32 @@ class ProbeKernelTab(QWidget):
         left_widget = QWidget()
         left_widget.setLayout(left_layout)
 
-        kernel_views_layout = QVBoxLayout()
-        kernel_views_layout.addWidget(self.kernel_view)
-        kernel_views_layout.addWidget(self.kernel_profile_plot)
-        kernel_views_widget = QWidget()
-        kernel_views_widget.setLayout(kernel_views_layout)
+        # Splitters (rather than plain layouts) so the panes can be resized
+        # by dragging their borders, same as the main window's own
+        # real-space/FFT split.
+        kernel_splitter = QSplitter(QtCore.Qt.Vertical)
+        kernel_splitter.addWidget(self.kernel_view)
+        kernel_splitter.addWidget(self.kernel_profile_plot)
+        kernel_splitter.setSizes([500, 150])
 
-        views_layout = QHBoxLayout()
-        views_layout.addWidget(self.probe_view)
-        views_layout.addWidget(kernel_views_widget)
-        views_widget = QWidget()
-        views_widget.setLayout(views_layout)
+        views_splitter = QSplitter(QtCore.Qt.Horizontal)
+        views_splitter.addWidget(self.probe_view)
+        views_splitter.addWidget(kernel_splitter)
+
+        main_splitter = QSplitter(QtCore.Qt.Horizontal)
+        main_splitter.addWidget(left_widget)
+        main_splitter.addWidget(views_splitter)
+        main_splitter.setSizes([300, 900])
 
         layout = QHBoxLayout()
-        layout.addWidget(left_widget, 1)
-        layout.addWidget(views_widget, 3)
+        layout.addWidget(main_splitter)
         self.setLayout(layout)
 
         self.update_kernel_controls_enabled(self.kernel_mode_combo.currentText())
 
     def use_current_selection(self):
         self._vacuum_datacube = None
-        self._set_source(
-            "selection", "Source: rectangular selection on current dataset"
-        )
+        self._set_source("selection", "Source: selection on current dataset")
 
     def load_vacuum_file(self):
         parent = self.window.parent
@@ -338,13 +369,58 @@ class ProbeKernelTab(QWidget):
     def _set_source(self, source, label_text):
         self._source = source
         self.source_label.setText(label_text)
+        self.synth_width_spin.setEnabled(source == "synthetic")
 
-        is_synthetic = source == "synthetic"
-        self.threshold_spin.setEnabled(not is_synthetic)
-        self.expansion_spin.setEnabled(not is_synthetic)
-        self.opening_spin.setEnabled(not is_synthetic)
-        self.synth_radius_spin.setEnabled(is_synthetic)
-        self.synth_width_spin.setEnabled(is_synthetic)
+    def _selection_roi_mask(self, parent) -> Optional[np.ndarray]:
+        """
+        Build a boolean R-space mask from whatever is currently selected on
+        the main window's virtual image -- a rectangular region, or a
+        single scan position (point selector).
+        """
+        detector: DetectorInfo = parent.get_virtual_image_detector()
+
+        if detector["shape"] is DetectorShape.RECTANGULAR:
+            return detector["mask"]
+
+        if detector["shape"] is DetectorShape.POINT:
+            xc, yc = detector["point"]
+            mask = np.zeros(parent.datacube.Rshape, dtype=np.bool_)
+            mask[xc, yc] = True
+            return mask
+
+        parent.statusBar().showMessage(
+            "Select a point or rectangular region on the virtual image to "
+            "use as the vacuum region.",
+            5_000,
+        )
+        return None
+
+    def _measure_probe_from_current_selection(self, parent):
+        """
+        Measure a (probe, alpha, qx0, qy0) from whatever is currently
+        selected on the main window (point or rectangular), or return None
+        (with a status bar message already shown) if there's no usable
+        selection.
+        """
+        mask = self._selection_roi_mask(parent)
+        if mask is None:
+            return None
+
+        threshold = self.threshold_spin.value()
+        expansion = self.expansion_spin.value()
+        opening = self.opening_spin.value()
+
+        if mask.sum() == 1:
+            xc, yc = (int(i[0]) for i in np.nonzero(mask))
+            probe = _vacuum_probe_from_single_pixel(
+                parent.datacube, xc, yc, threshold, expansion, opening
+            )
+        else:
+            probe = parent.datacube.get_vacuum_probe(
+                threshold=threshold, expansion=expansion, opening=opening, ROI=mask
+            )
+        alpha, qx0, qy0 = parent.datacube.get_probe_size(probe.probe)
+        return probe, alpha, qx0, qy0
 
     def generate_probe(self):
         parent = self.window.parent
@@ -355,23 +431,10 @@ class ProbeKernelTab(QWidget):
             return
 
         if self._source == "selection":
-            detector: DetectorInfo = parent.get_virtual_image_detector()
-            if detector["shape"] is not DetectorShape.RECTANGULAR:
-                parent.statusBar().showMessage(
-                    "Select a rectangular region on the virtual image to use as "
-                    "the vacuum region.",
-                    5_000,
-                )
+            result = self._measure_probe_from_current_selection(parent)
+            if result is None:
                 return
-            self.probe = parent.datacube.get_vacuum_probe(
-                threshold=self.threshold_spin.value(),
-                expansion=self.expansion_spin.value(),
-                opening=self.opening_spin.value(),
-                ROI=detector["mask"],
-            )
-            self.alpha, self.qx0, self.qy0 = parent.datacube.get_probe_size(
-                self.probe.probe
-            )
+            self.probe, self.alpha, self.qx0, self.qy0 = result
             self.synth_radius_spin.setValue(self.alpha)
 
         elif self._source == "vacuum_file":
@@ -389,6 +452,16 @@ class ProbeKernelTab(QWidget):
             self.synth_radius_spin.setValue(self.alpha)
 
         elif self._source == "synthetic":
+            # Always re-measure the BF disk radius from the current
+            # selection, so the synthetic probe reflects it exactly rather
+            # than depending on a manually-entered or possibly-stale value.
+            # Falls back to the current spinbox value (e.g. hand-entered)
+            # if there's no usable selection to measure from.
+            result = self._measure_probe_from_current_selection(parent)
+            if result is not None:
+                _, measured_alpha, _, _ = result
+                self.synth_radius_spin.setValue(measured_alpha)
+
             Qshape = (parent.datacube.Q_Nx, parent.datacube.Q_Ny)
             radius = self.synth_radius_spin.value()
             self.probe = py4DSTEM.Probe.generate_synthetic_probe(
@@ -585,7 +658,13 @@ class BraggPreviewPane(QGroupBox):
 
     def set_realspace_image(self, image: Optional[np.ndarray]):
         if image is not None:
-            self.rs_view.setImage(image, autoLevels=True, autoRange=True)
+            # Transposed to match the main window's real_space_widget
+            # convention (see _render_virtual_image in update_views.py) --
+            # otherwise non-square scan shapes appear flipped/rotated
+            # relative to the main virtual image view, and get_scan_position
+            # below (which mirrors the main window's own point-selector
+            # reading convention) would read back the wrong (xc, yc).
+            self.rs_view.setImage(image.T, autoLevels=True, autoRange=True)
 
     def set_marker_diameter(self, diameter):
         self.scatter.setSize(diameter)
@@ -600,7 +679,9 @@ class BraggPreviewPane(QGroupBox):
 
     def update_dp(self, dp, scale_fn, relevel):
         self.last_dp = dp
-        scaled = scale_fn(dp)
+        # Transposed to match the main window's diffraction_space_widget
+        # convention (see _render_diffraction_image in update_views.py).
+        scaled = scale_fn(dp).T
 
         if relevel or not self._has_shown_dp:
             levels = tuple(np.percentile(scaled, [0.1, 99.9]))
@@ -619,11 +700,11 @@ class BraggPreviewPane(QGroupBox):
             self.dp_view.setImage(scaled, autoLevels=False, autoRange=False)
 
     def update_scatter(self, qx, qy):
-        # ScatterPlotItem positions map directly onto the array indices
-        # ImageView.setImage was given -- no axis swap needed here (verified
-        # empirically; the old interactive_disk_detection branch's swap was
-        # a leftover from a different image-display setup and is wrong here).
-        spots = [{"pos": [x, y], "data": 1} for x, y in zip(qx, qy)]
+        # dp is displayed transposed (see update_dp), so marker positions
+        # need the same (y, x) swap to stay aligned with the disks --
+        # verified empirically with an offscreen render against a synthetic
+        # test image.
+        spots = [{"pos": [y, x], "data": 1} for x, y in zip(qx, qy)]
         self.scatter.setData(spots)
 
 
