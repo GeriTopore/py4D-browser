@@ -107,6 +107,7 @@ class DiskDetectionWindow(QDialog):
 
         self.parent = parent
         self.probe = None  # the accepted Probe object, once the user hits Accept
+        self.probe_radius = None  # measured bright-field disk radius, in pixels
 
         self.setWindowTitle("Disk Detection")
 
@@ -125,8 +126,9 @@ class DiskDetectionWindow(QDialog):
 
         self.resize(1100, 750)
 
-    def probe_accepted(self, probe):
+    def probe_accepted(self, probe, probe_radius):
         self.probe = probe
+        self.probe_radius = probe_radius
 
         bragg_tab_index = self.tab_widget.indexOf(self.bragg_disk_tab)
         self.tab_widget.setTabEnabled(bragg_tab_index, True)
@@ -236,6 +238,18 @@ class ProbeKernelTab(QWidget):
         self.kernel_view = pg.ImageView()
         self.kernel_view.setImage(np.zeros((256, 256)))
 
+        # Line profiles through the kernel center, along x and along y,
+        # so the falloff shape (e.g. gaussian/sigmoid rolloff) can be judged.
+        self.kernel_profile_plot = pg.PlotWidget()
+        self.kernel_profile_plot.addLegend()
+        self.kernel_profile_plot.setMaximumHeight(150)
+        self._kernel_x_curve = self.kernel_profile_plot.plot(
+            pen=pg.mkPen("y", width=2), name="x profile"
+        )
+        self._kernel_y_curve = self.kernel_profile_plot.plot(
+            pen=pg.mkPen("c", width=2), name="y profile"
+        )
+
         self.accept_button = QPushButton("Accept")
         self.accept_button.setEnabled(False)
         self.accept_button.clicked.connect(self.accept)
@@ -250,9 +264,15 @@ class ProbeKernelTab(QWidget):
         left_widget = QWidget()
         left_widget.setLayout(left_layout)
 
+        kernel_views_layout = QVBoxLayout()
+        kernel_views_layout.addWidget(self.kernel_view)
+        kernel_views_layout.addWidget(self.kernel_profile_plot)
+        kernel_views_widget = QWidget()
+        kernel_views_widget.setLayout(kernel_views_layout)
+
         views_layout = QHBoxLayout()
         views_layout.addWidget(self.probe_view)
-        views_layout.addWidget(self.kernel_view)
+        views_layout.addWidget(kernel_views_widget)
         views_widget = QWidget()
         views_widget.setLayout(views_layout)
 
@@ -324,7 +344,7 @@ class ProbeKernelTab(QWidget):
             self.probe.probe
         )
 
-        self.probe_view.setImage(self.probe.probe, autoLevels=True)
+        self.probe_view.setImage(self.probe.probe, autoLevels=True, autoRange=True)
         self.accept_button.setEnabled(False)
 
     def update_kernel_controls_enabled(self, mode):
@@ -349,12 +369,21 @@ class ProbeKernelTab(QWidget):
             )
 
         self.probe.get_kernel(mode=mode, origin=(self.qx0, self.qy0), **kwargs)
-        self.kernel_view.setImage(np.fft.fftshift(self.probe.kernel), autoLevels=True)
+        kernel_shifted = np.fft.fftshift(self.probe.kernel)
+        self.kernel_view.setImage(kernel_shifted, autoLevels=True, autoRange=True)
+
+        cx, cy = kernel_shifted.shape[0] // 2, kernel_shifted.shape[1] // 2
+        self._kernel_x_curve.setData(
+            np.arange(kernel_shifted.shape[0]), kernel_shifted[:, cy]
+        )
+        self._kernel_y_curve.setData(
+            np.arange(kernel_shifted.shape[1]), kernel_shifted[cx, :]
+        )
 
         self.accept_button.setEnabled(True)
 
     def accept(self):
-        self.window.probe_accepted(self.probe)
+        self.window.probe_accepted(self.probe, self.alpha)
 
 
 class BraggDiskSettingsPane(QGroupBox):
@@ -474,9 +503,16 @@ class BraggPreviewPane(QGroupBox):
         self.dp_view = pg.ImageView()
         self.dp_view.setImage(np.zeros((512, 512)))
 
-        # Bragg disk positions detected at this pane's scan position
+        # Bragg disk positions detected at this pane's scan position, drawn
+        # as open rings sized to match the measured bright-field disk
+        # diameter (set via set_marker_diameter once a probe is accepted).
         self.scatter = pg.ScatterPlotItem(
-            size=12, pen=pg.mkPen(None), brush=pg.mkBrush(0, 255, 0, 150)
+            size=12,
+            pen=pg.mkPen("g", width=2),
+            brush=None,
+            symbol="o",
+            pxMode=False,  # size is in data (pixel) units, not screen pixels,
+            # so markers scale with the image the same way the disks do
         )
         self.dp_view.getView().addItem(self.scatter)
 
@@ -487,7 +523,10 @@ class BraggPreviewPane(QGroupBox):
 
     def set_realspace_image(self, image: Optional[np.ndarray]):
         if image is not None:
-            self.rs_view.setImage(image, autoLevels=True)
+            self.rs_view.setImage(image, autoLevels=True, autoRange=True)
+
+    def set_marker_diameter(self, diameter):
+        self.scatter.setSize(diameter)
 
     def get_scan_position(self, datacube):
         roi_state = self.rs_selector.saveState()
@@ -498,10 +537,17 @@ class BraggPreviewPane(QGroupBox):
         return xc, yc
 
     def update_dp_and_scatter(self, dp, qx, qy):
-        self.dp_view.setImage(dp, autoLevels=True, autoRange=False)
-        # NOTE: pyqtgraph displays image axes transposed relative to numpy
-        # indexing, hence the qx/qy swap here to align markers with disks.
-        spots = [{"pos": [y + 0.5, x + 0.5], "data": 1} for x, y in zip(qx, qy)]
+        # Square-root scaling (matching the main window's default diffraction
+        # scaling) plus percentile-based levels, so the faint diffracted
+        # disks remain visible alongside the much brighter central beam.
+        scaled = np.sqrt(np.maximum(dp, 0))
+        levels = tuple(np.percentile(scaled, [0.1, 99.9]))
+        self.dp_view.setImage(scaled, autoLevels=False, levels=levels, autoRange=True)
+        # ScatterPlotItem positions map directly onto the array indices
+        # ImageView.setImage was given -- no axis swap needed here (verified
+        # empirically; the old interactive_disk_detection branch's swap was
+        # a leftover from a different image-display setup and is wrong here).
+        spots = [{"pos": [x, y], "data": 1} for x, y in zip(qx, qy)]
         self.scatter.setData(spots)
 
 
@@ -542,8 +588,10 @@ class BraggDiskTab(QWidget):
     def on_probe_accepted(self):
         parent = self.window.parent
         vimg = parent.get_virtual_image()
+        diameter = 2 * self.window.probe_radius
         for pane in self.panes:
             pane.set_realspace_image(vimg)
+            pane.set_marker_diameter(diameter)
         self.update_previews()
 
     def update_previews(self, *_):
