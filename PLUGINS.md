@@ -10,6 +10,7 @@ We hope to maintain a list of existing plugins here. If you produce a browser pl
 Parts of what used to be "core" functionality are now implemented using the plugin interface to separate them from the core browser code. These are packaged with py4DGUI and always available:
 * `Calibration`: Allows for the calibration of the scale bars using known physical distances. **Note:** This plugin is currently considered "badly behaved" because of the way it accesses the detector ROI objects directly. An abstract interface for this behavior will be created in the future, but for now this plugin should not be considered an "example" to follow.
 * `tcBF`: Allows for the computation of tilt-corrected brightfield images. This also accesses detector ROIs directly and should be considered "badly behaved".
+* `Disk Detection`: Allows for generating a probe kernel (from a vacuum region of the current dataset, or from a separate vacuum-only file) and interactively tuning Bragg disk detection parameters, previewed live at three independent scan positions, before running detection across the whole dataset. This plugin is considered conforming to the guidelines: it never draws onto the shared `diffraction_space_widget`/`real_space_widget`, keeping its own preview panes and point selectors in its own window instead.
 
 ### External plugins
 * [EMPAD2 Raw File Reader](https://github.com/sezelt/empad2): This also previously was present in the core browser code and would add an additional menu if the external package was installed. This adds the ability to import the "concatenated" raw binary data from the TFS EMPAD-G2 detector. This plugin is considered conforming to the guidelines.  
@@ -64,6 +65,8 @@ The current implementation of the plugin interface is thus extremely simple: the
 ## Accessing the detectors
 
 With version 1.3.0, there is a new API for accessing the ROI selections made using the detectors on the two views. Plugins should only interact with the detectors via this API, as the implementation details of the ROI objects themselves are considered internal and subject to change. Calling `get_diffraction_detector` or `get_virtual_image_detector` yields a `DetectorInfo` object containing the properties of the current detector and the information (either a slice or a mask array) needed to produce the selection it represents.
+
+If a plugin needs a read-only snapshot of the array currently displayed in the real-space (virtual image) view — for example, to seed its own preview panes — it can call `get_virtual_image()`, which returns the raw, unscaled image (or `None` if none has been set yet).
 
 ## Namespace packages
 
