@@ -63,6 +63,7 @@ class DataViewer(QMainWindow):
         set_result_image,
         get_diffraction_detector,
         get_virtual_image_detector,
+        get_virtual_image,
         _render_virtual_image,
         _render_diffraction_image,
         _render_result_image,

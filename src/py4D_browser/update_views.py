@@ -183,6 +183,15 @@ def get_virtual_image_detector(self: "DataViewer") -> DetectorInfo:
             raise ValueError("Detector could not be determined")
 
 
+def get_virtual_image(self: "DataViewer") -> Optional[np.ndarray]:
+    """
+    Get the raw, unscaled virtual image currently displayed in the
+    real-space view (i.e. the array most recently passed to
+    set_virtual_image), or None if no image has been set yet.
+    """
+    return self.unscaled_realspace_image
+
+
 def update_real_space_view(self: "DataViewer", reset=False):
     if self.datacube is None:
         return
