@@ -464,17 +464,17 @@ class BraggDiskSettingsPane(QGroupBox):
 
         self.sigma_cc_spin = QDoubleSpinBox()
         self.sigma_cc_spin.setRange(0.0, 100.0)
-        self.sigma_cc_spin.setValue(0.0)
+        self.sigma_cc_spin.setValue(2.0)
         form.addRow("Correlation Smoothing Sigma", self.sigma_cc_spin)
 
         self.subpixel_combo = QComboBox()
         self.subpixel_combo.addItems(["pixel", "poly", "multicorr"])
-        self.subpixel_combo.setCurrentText("poly")
+        self.subpixel_combo.setCurrentText("multicorr")
         form.addRow("Subpixel Mode", self.subpixel_combo)
 
         self.upsample_factor_spin = QSpinBox()
-        self.upsample_factor_spin.setRange(0, 256)
-        self.upsample_factor_spin.setValue(0)
+        self.upsample_factor_spin.setRange(1, 256)
+        self.upsample_factor_spin.setValue(16)
         form.addRow("Upsample Factor", self.upsample_factor_spin)
 
         self.min_abs_intensity_spin = QDoubleSpinBox()
@@ -487,7 +487,7 @@ class BraggDiskSettingsPane(QGroupBox):
         self.min_rel_intensity_spin.setRange(0.0, 1.0)
         self.min_rel_intensity_spin.setDecimals(5)
         self.min_rel_intensity_spin.setSingleStep(0.001)
-        self.min_rel_intensity_spin.setValue(0.0)
+        self.min_rel_intensity_spin.setValue(0.005)
         form.addRow("Minimum Relative Intensity", self.min_rel_intensity_spin)
 
         self.relative_to_peak_spin = QSpinBox()
@@ -497,17 +497,17 @@ class BraggDiskSettingsPane(QGroupBox):
 
         self.min_peak_spacing_spin = QSpinBox()
         self.min_peak_spacing_spin.setRange(0, 1000)
-        self.min_peak_spacing_spin.setValue(0)
+        self.min_peak_spacing_spin.setValue(60)
         form.addRow("Minimum Peak Spacing (px)", self.min_peak_spacing_spin)
 
         self.edge_boundary_spin = QSpinBox()
         self.edge_boundary_spin.setRange(0, 1000)
-        self.edge_boundary_spin.setValue(0)
+        self.edge_boundary_spin.setValue(20)
         form.addRow("Edge Boundary (px)", self.edge_boundary_spin)
 
         self.max_num_peaks_spin = QSpinBox()
-        self.max_num_peaks_spin.setRange(0, 1000)
-        self.max_num_peaks_spin.setValue(0)
+        self.max_num_peaks_spin.setRange(1, 1000)
+        self.max_num_peaks_spin.setValue(70)
         form.addRow("Max Number of Peaks", self.max_num_peaks_spin)
 
         self.cuda_checkbox = QCheckBox()
@@ -649,11 +649,18 @@ class BraggDiskTab(QWidget):
         self.add_pane_button = QPushButton("Add Preview Position")
         self.add_pane_button.clicked.connect(self.add_pane)
 
+        # Off by default: previews only update when a point selector drag is
+        # released. When checked, previews also update continuously while
+        # dragging (can be too slow/jumpy to want on all the time).
+        self.live_update_checkbox = QCheckBox("Live Update While Dragging")
+        self.live_update_checkbox.setChecked(False)
+
         left_layout = QVBoxLayout()
         left_layout.addWidget(self.settings_pane)
         left_layout.addWidget(scaling_box)
         left_layout.addWidget(self.find_all_button)
         left_layout.addWidget(self.add_pane_button)
+        left_layout.addWidget(self.live_update_checkbox)
         left_layout.addStretch()
         left_widget = QWidget()
         left_widget.setLayout(left_layout)
@@ -714,11 +721,14 @@ class BraggDiskTab(QWidget):
             return
 
         pane = BraggPreviewPane(f"Preview {len(self.panes) + 1}")
-        # sigRegionChanged (not sigRegionChangeFinished) fires continuously
-        # while dragging, so the preview updates live as the point selector
-        # is moved rather than only once it's released.
-        pane.rs_selector.sigRegionChanged.connect(
+        # Always update once the drag is released. Also update continuously
+        # during the drag (sigRegionChanged), but only if the user has
+        # opted into that via the "Live Update While Dragging" checkbox.
+        pane.rs_selector.sigRegionChangeFinished.connect(
             partial(self.update_previews, panes=[pane])
+        )
+        pane.rs_selector.sigRegionChanged.connect(
+            partial(self._on_pane_region_changed, pane)
         )
         self.panes.append(pane)
         self.previews_layout.addWidget(pane)
@@ -734,6 +744,10 @@ class BraggDiskTab(QWidget):
 
     def add_pane(self):
         self._append_pane()
+
+    def _on_pane_region_changed(self, pane, *_):
+        if self.live_update_checkbox.isChecked():
+            self.update_previews(panes=[pane])
 
     def on_probe_accepted(self):
         parent = self.window.parent
